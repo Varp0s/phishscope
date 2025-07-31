@@ -1,0 +1,9 @@
+construct
+aiohttp
+aioprocessing
+PyOpenSSL
+websockets
+requests
+psycopg2-binary
+asyncpg
+python-dotenv

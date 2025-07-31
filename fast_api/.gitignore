@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+schema/__init__.py
+plugins/__init__.py
+core/__init__.py
+api/__init__.py
+api/v1/__init__.py
+api/v1/endpoints/__init__.py
+env/.env
+logs/api.log

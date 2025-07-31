@@ -1,0 +1,7 @@
+__pycache__/
+helper/__init__.py
+helper/*.pyc
+plugins/__init__.py
+plugins/*.pyc
+env/.env
+logs/crawler.log

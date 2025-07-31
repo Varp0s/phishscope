@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: phishing_crawler
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # pgAdmin
+  pgadmin:
+    image: dpage/pgadmin4
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@pentester.dad
+      PGADMIN_DEFAULT_PASSWORD: H4y4lp3r32t3rb12474m4nl3tm3!@#
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # FastAPI Backend
+  fastapi:
+    build: ./fast_api
+    restart: always
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: phishing_crawler
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./fast_api/logs:/app/logs
+
+  # React UI
+  ui:
+    build: ./ui
+    restart: always
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000/v1
+    ports:
+      - "3000:5173"
+    depends_on:
+      - fastapi
+
+  # Certificate Stream Server (existing)
+  certstream:
+    build: ./certstream_server
+    restart: always
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: phishing_crawler
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./certstream_server/logs:/app/logs
+
+volumes:
+  postgres_data:

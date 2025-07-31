@@ -1,6 +1,8 @@
 # PhishScope 🎣🔍
 
 A comprehensive phishing detection and monitoring platform that combines certificate transparency monitoring, threat intelligence feeds, and URL analysis to identify and track phishing websites in real-time.
+<img width="1347" height="1220" alt="image" src="https://github.com/user-attachments/assets/c2be3cd1-8002-4b65-886d-844111c68f8b" />
+
 
 ## 🌟 Features
 

@@ -25,10 +25,11 @@ A comprehensive phishing detection and monitoring platform that combines certifi
 
 PhishScope consists of four main components:
 
-### 1. Certificate Stream Server (`certstream_server/`)
+### 1. Certificate Stream Server (`ssl_stream_server/`)
 - Monitors Certificate Transparency (CT) logs in real-time
 - Identifies suspicious domain patterns and keywords
 - Stores certificate data for analysis
+- I reorganized the [certstream server](https://github.com/CaliDog/certstream-server) repo and got it working.
 
 ### 2. Phishing Crawler (`phish_crawl/`)
 - Aggregates data from multiple threat intelligence sources:

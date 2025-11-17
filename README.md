@@ -65,7 +65,7 @@ PhishScope consists of four main components:
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/phishscope.git
+   git clone https://github.com/Varp0s/phishscope.git
    cd phishscope
    ```
 

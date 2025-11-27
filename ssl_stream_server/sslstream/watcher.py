@@ -1,317 +1,298 @@
-import aiohttp
 import asyncio
+import aiohttp
+from asyncio import Queue
 import logging
-import math
-import requests
-import sys
-import os
 
-from sslstream.certlib import parse_ctl_entry
+logger = logging.getLogger(__name__)
 
-class TransparencyWatcher(object):
-    BAD_CT_SERVERS = [
-        "alpha.ctlogs.org",
-        "clicky.ct.letsencrypt.org",
-        "ct.akamai.com",
-        "ct.filippo.io/behindthesofa",
-        "ct.gdca.com.cn",
-        "ct.izenpe.com",
-        "ct.izenpe.eus",
-        "ct.sheca.com",
-        "ct.startssl.com",
-        "ct.wosign.com",
-        "ctlog.api.venafi.com",
-        "ctlog.gdca.com.cn",
-        "ctlog.sheca.com",
-        "ctlog.wosign.com",
-        "ctlog2.wosign.com",
-        "flimsy.ct.nordu.net:8080",
-        "log.certly.io",
-        "nessie2021.ct.digicert.com/log",
-        "plausible.ct.nordu.net",
-        "www.certificatetransparency.cn/ct",
-    ]
+# Configuration
+MAX_BLOCK_SIZE = 512
+CONCURRENT_REQUESTS = 50
+CONNECTION_TIMEOUT = 30
+READ_TIMEOUT = 60
 
-    MAX_BLOCK_SIZE = 64
+# Comprehensive CT Log Sources - All major operators included
+CT_LOG_SOURCES = [
+    # Google Argon Logs (2021-2025)
+    "https://ct.googleapis.com/logs/argon2021",
+    "https://ct.googleapis.com/logs/argon2022",
+    "https://ct.googleapis.com/logs/argon2023",
+    "https://ct.googleapis.com/logs/argon2024",
+    "https://ct.googleapis.com/logs/argon2025",
+    
+    # Google Xenon Logs (2021-2025)
+    "https://ct.googleapis.com/logs/xenon2021",
+    "https://ct.googleapis.com/logs/xenon2022",
+    "https://ct.googleapis.com/logs/xenon2023",
+    "https://ct.googleapis.com/logs/xenon2024",
+    "https://ct.googleapis.com/logs/xenon2025",
+    
+    # Google Icarus/Pilot/Rocketeer/Skydiver/Submariner
+    "https://ct.googleapis.com/icarus",
+    "https://ct.googleapis.com/pilot",
+    "https://ct.googleapis.com/rocketeer",
+    "https://ct.googleapis.com/skydiver",
+    "https://ct.googleapis.com/submariner",
+    
+    # Google US Regional (us1)
+    "https://us1.ct.googleapis.com/logs/us1/argon2024",
+    "https://us1.ct.googleapis.com/logs/us1/argon2025",
+    "https://us1.ct.googleapis.com/logs/us1/xenon2024",
+    "https://us1.ct.googleapis.com/logs/us1/xenon2025",
+    
+    # Google EU Regional (eu1)
+    "https://eu1.ct.googleapis.com/logs/eu1/argon2024",
+    "https://eu1.ct.googleapis.com/logs/eu1/argon2025",
+    "https://eu1.ct.googleapis.com/logs/eu1/xenon2024",
+    "https://eu1.ct.googleapis.com/logs/eu1/xenon2025",
+    
+    # Google APAC Regional (asia1)
+    "https://asia1.ct.googleapis.com/logs/asia1/argon2024",
+    "https://asia1.ct.googleapis.com/logs/asia1/argon2025",
+    "https://asia1.ct.googleapis.com/logs/asia1/xenon2024",
+    "https://asia1.ct.googleapis.com/logs/asia1/xenon2025",
+    
+    # Cloudflare Nimbus Logs (2021-2025)
+    "https://ct.cloudflare.com/logs/nimbus2021",
+    "https://ct.cloudflare.com/logs/nimbus2022",
+    "https://ct.cloudflare.com/logs/nimbus2023",
+    "https://ct.cloudflare.com/logs/nimbus2024",
+    "https://ct.cloudflare.com/logs/nimbus2025",
+    
+    # DigiCert Logs
+    "https://ct1.digicert-ct.com/log",
+    "https://ct2.digicert-ct.com/log",
+    "https://yeti2024.ct.digicert.com/log",
+    "https://yeti2025.ct.digicert.com/log",
+    "https://nessie2024.ct.digicert.com/log",
+    "https://nessie2025.ct.digicert.com/log",
+    "https://wyvern.ct.digicert.com/2024",
+    "https://wyvern.ct.digicert.com/2025",
+    "https://sphinx.ct.digicert.com/2024",
+    "https://sphinx.ct.digicert.com/2025",
+    
+    # Let's Encrypt Oak Logs (2021-2025)
+    "https://oak.ct.letsencrypt.org/2021",
+    "https://oak.ct.letsencrypt.org/2022",
+    "https://oak.ct.letsencrypt.org/2023",
+    "https://oak.ct.letsencrypt.org/2024",
+    "https://oak.ct.letsencrypt.org/2025",
+    
+    # Sectigo Logs (Mammoth & Sabre)
+    "https://mammoth.ct.comodo.com",
+    "https://sabre.ct.comodo.com",
+    "https://sabre2024h1.ct.sectigo.com",
+    "https://sabre2024h2.ct.sectigo.com",
+    "https://sabre2025h1.ct.sectigo.com",
+    "https://sabre2025h2.ct.sectigo.com",
+    "https://mammoth2024h1.ct.sectigo.com",
+    "https://mammoth2024h2.ct.sectigo.com",
+    "https://mammoth2025h1.ct.sectigo.com",
+    "https://mammoth2025h2.ct.sectigo.com",
+    
+    # TrustAsia Logs
+    "https://ct.trustasia.com/log2021",
+    "https://ct.trustasia.com/log2022",
+    "https://ct.trustasia.com/log2023",
+    "https://ct.trustasia.com/log2024",
+    "https://ct.trustasia.com/log2025",
+    "https://ct2021.trustasia.com/log2021",
+    "https://ct2024.trustasia.com/log2024",
+    "https://ct2025.trustasia.com/log2025",
+    
+    # Symantec/Norton Logs
+    "https://ct.ws.symantec.com",
+    "https://vega.ws.symantec.com",
+    
+    # CNNIC Logs (China)
+    "https://ctserver.cnnic.cn",
+    "https://ct.gdca.com.cn",
+    
+    # StartCom Logs
+    "https://ct.startssl.com",
+    
+    # Venafi Logs
+    "https://ctlog.api.venafi.com",
+    "https://ctlog-gen2.api.venafi.com",
+    
+    # Certly Logs
+    "https://log.certly.io",
+    
+    # Izenpe Logs
+    "https://ct.izenpe.eus",
+    
+    # WoSign Logs
+    "https://ct.wosign.com",
+    "https://ctlog.wosign.com",
+    
+    # GDCA (China)
+    "https://ct.gdca.com.cn",
+    "https://ctlog.gdca.com.cn",
+    
+    # SHECA (Shanghai CA)
+    "https://ct.sheca.com",
+    
+    # Nordu Logs (Nordic)
+    "https://plausible.ct.nordu.net",
+    "https://plausible.ct.nordu.net:8080",
+    
+    # SSLMate CertSpotter
+    "https://certspotter.com",
+    
+    # Additional Active Logs
+    "https://ct-log.gdca.com.cn",
+    "https://ctserver.trustasia.com",
+    "https://ct.akamai.com",
+    "https://alpha.ctlogs.org",
+]
 
-    def __init__(self, _loop):
-        self.loop = _loop
-        self.stopped = False
-        self.logger = logging.getLogger('certstream.watcher')
 
-        self.stream = asyncio.Queue(maxsize=3000)
-
-        self.logger.info("Initializing the CTL watcher")
-
-    def _initialize_ts_logs(self):
-        try:
-            self.logger.info("Retrieving certificate transparency logs list from Google...")
-            response = requests.get('https://www.gstatic.com/ct/log_list/v3/all_logs_list.json', timeout=10)
-            response.raise_for_status() 
-            official_log_data = response.json()
-            usable_logs = []
-            
-            for operator in official_log_data.get('operators', []):
-                for log in operator.get('logs', []):
-                    if 'state' in log and 'usable' in log['state']:
-                        url = log['url']
-                        if url.startswith('https://'):
-                            url = url[8:] 
-                        if url.endswith('/'):
-                            url = url[:-1] 
-
-                        usable_logs.append({
-                            'description': log['description'],
-                            'url': url,
-                            'operator': operator['name']
-                        })
-            
-            self.transparency_logs = {'logs': usable_logs}
-            self.logger.info(f"Found {len(usable_logs)} usable logs from the official list")
-            
-        except Exception as e:
-            self.logger.error(f"Error retrieving certificate directory: {str(e)}")
-            self.logger.info("Using fallback transparency logs list...")
-            self.transparency_logs = {
-                "logs": [
-                    {
-                        "description": "Google 'Argon2025h1' log",
-                        "url": "ct.googleapis.com/logs/us1/argon2025h1",
-                        "operator": "Google"
-                    },
-                    {
-                        "description": "Google 'Argon2025h2' log", 
-                        "url": "ct.googleapis.com/logs/us1/argon2025h2",
-                        "operator": "Google"
-                    },
-                    {
-                        "description": "Google 'Xenon2025h1' log",
-                        "url": "ct.googleapis.com/logs/eu1/xenon2025h1",
-                        "operator": "Google"
-                    },
-                    {
-                        "description": "Google 'Xenon2025h2' log",
-                        "url": "ct.googleapis.com/logs/eu1/xenon2025h2", 
-                        "operator": "Google"
-                    },
-                    {
-                        "description": "Cloudflare 'Nimbus2025'",
-                        "url": "ct.cloudflare.com/logs/nimbus2025",
-                        "operator": "Cloudflare"
-                    },
-                    {
-                        "description": "DigiCert Yeti2025 Log",
-                        "url": "yeti2025.ct.digicert.com/log",
-                        "operator": "DigiCert"
-                    },
-                    {
-                        "description": "Let's Encrypt 'Oak2025h1'",
-                        "url": "oak.ct.letsencrypt.org/2025h1",
-                        "operator": "Let's Encrypt"
-                    },
-                    {
-                        "description": "Let's Encrypt 'Oak2025h2'",
-                        "url": "oak.ct.letsencrypt.org/2025h2",
-                        "operator": "Let's Encrypt"
-                    },
-                    {
-                        "description": "TrustAsia Log2025a",
-                        "url": "ct2025-a.trustasia.com/log2025a",
-                        "operator": "TrustAsia"
-                    },
-                    {
-                        "description": "TrustAsia Log2025b",
-                        "url": "ct2025-b.trustasia.com/log2025b",
-                        "operator": "TrustAsia"
-                    }
-                ]
-            }
-
-        self.logger.info("Retrieved transparency log with {} entries to watch.".format(len(self.transparency_logs['logs'])))
-        for entry in self.transparency_logs['logs']:
-            operator_info = f" ({entry.get('operator', 'Unknown')})" if 'operator' in entry else ""
-            self.logger.info("  + {}{}".format(entry['description'], operator_info))
-
-    async def _print_memory_usage(self):
-        import objgraph
-        import gc
-
-        while True:
-            print("Stream backlog : {}".format(self.stream.qsize()))
-            gc.collect()
-            objgraph.show_growth()
-            await asyncio.sleep(60)
-
-    def get_tasks(self):
-        self._initialize_ts_logs()
-
-        coroutines = []
-
-        if os.getenv("DEBUG_MEMORY", False):
-            coroutines.append(self._print_memory_usage())
-
-        self.logger.info(f"Setting up tasks for {len(self.transparency_logs['logs'])} certificate transparency logs")
+class TransparencyWatcher:
+    def __init__(self, loop=None):
+        self.loop = loop or asyncio.get_event_loop()
+        self.queue = Queue(maxsize=100000)
+        self.session = None
+        self.running = False
+        self.log_positions = {}  # Track position in each log
+        self.connector = None
         
-        for log in self.transparency_logs['logs']:
-            url = log['url']
-            skip = False
-            
-            for bad_server in self.BAD_CT_SERVERS:
-                if bad_server in url:
-                    operator_info = f" ({log.get('operator', 'Unknown')})" if 'operator' in log else ""
-                    self.logger.info(f"Skipping {log['description']}{operator_info} (in bad servers list)")
-                    skip = True
-                    break
-            
-            if not skip:
-                operator_info = f" ({log.get('operator', 'Unknown')})" if 'operator' in log else ""
-                self.logger.info(f"Adding task for {log['description']}{operator_info} ({url})")
-                coroutines.append(self.watch_for_updates_task(log))
-        
-        self.logger.info(f"Created {len(coroutines)} CT log monitoring tasks")
-        return coroutines
-
-    def stop(self):
-        self.logger.info('Got stop order, exiting...')
-        self.stopped = True
-        for task in asyncio.Task.all_tasks():
-            task.cancel()
-
-    async def watch_for_updates_task(self, operator_information):
+    async def create_session(self):
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(
+                total=CONNECTION_TIMEOUT + READ_TIMEOUT,
+                connect=CONNECTION_TIMEOUT,
+                sock_read=READ_TIMEOUT
+            )
+            self.connector = aiohttp.TCPConnector(
+                limit=CONCURRENT_REQUESTS * 2,
+                limit_per_host=10,
+                ttl_dns_cache=600,
+                force_close=False,
+                enable_cleanup_closed=True
+            )
+            self.session = aiohttp.ClientSession(
+                connector=self.connector,
+                timeout=timeout,
+                headers={"User-Agent": "PhishScope-CT-Monitor/2.0"}
+            )
+        return self.session
+    
+    async def close(self):
+        self.running = False
+        if self.session and not self.session.closed:
+            await self.session.close()
+        if self.connector:
+            await self.connector.close()
+    
+    async def get_sth(self, log_url: str) -> dict:
         try:
-            latest_size = 0
-            name = operator_information['description']
-            self.logger.info(f"[{name}] Starting CT log monitoring task")
-            while not self.stopped:
-                try:
-                    url = operator_information['url']
-                    if url.startswith(("http://", "https://")):
-                        parsed_url = url.replace("https://", "").replace("http://", "")
-                        ct_url = f"https://{parsed_url}/ct/v1/get-sth"
-                    else:
-                        ct_url = f"https://{url}/ct/v1/get-sth"
-                    
-                    self.logger.info(f"[{name}] Connecting to {ct_url}")
-                    timeout = aiohttp.ClientTimeout(total=30)
-                    
-                    async with aiohttp.ClientSession(loop=self.loop, timeout=timeout) as session:
-                        self.logger.info(f"[{name}] Session created, sending request...")
-                        async with session.get(ct_url) as response:
-                            self.logger.info(f"[{name}] Response received with status {response.status}")
-                            if response.status == 200:
-                                info = await response.json()
-                                self.logger.info(f"[{name}] Successfully retrieved CT log data")
-                            else:
-                                error_text = await response.text()
-                                self.logger.error(f"[{name}] HTTP error: {response.status}, {error_text}")
-                                await asyncio.sleep(300)
-                                continue
-                                
-                except aiohttp.ClientError as e:
-                    self.logger.error(f'[{name}] Connection error -> {str(e)}')
-                    await asyncio.sleep(300) 
-                    continue
-                except asyncio.TimeoutError:
-                    self.logger.error(f'[{name}] Connection timeout')
-                    await asyncio.sleep(300)
-                    continue
-                except Exception as e:
-                    self.logger.error(f'[{name}] Unexpected error: {str(e)}')
-                    await asyncio.sleep(300)
-                    continue
-
-                tree_size = info.get('tree_size')
-                self.logger.info(f'[{name}] Current tree size: {tree_size}')
-
-                if latest_size == 0:
-                    self.logger.info(f'[{name}] First run, setting initial size to {tree_size}')
-                    latest_size = tree_size
-
-                if latest_size < tree_size:
-                    self.logger.info(f'[{name}] [{latest_size} -> {tree_size}] New certs found, updating!')
-
-                    try:
-                        cert_count = 0
-                        async for result_chunk in self.get_new_results(operator_information, latest_size, tree_size):
-                            chunk_size = len(result_chunk)
-                            self.logger.info(f'[{name}] Processing chunk of {chunk_size} certificates')
-                            
-                            successful_parses = 0
-                            for entry in result_chunk:
-                                try:
-                                    cert_data = parse_ctl_entry(entry, operator_information)
-                                    if cert_data is not None:
-                                        await self.stream.put(cert_data)
-                                        cert_count += 1
-                                        successful_parses += 1
-                                    else:
-                                        self.logger.debug(f'[{name}] Skipped certificate (parsing returned None)')
-                                except Exception as parse_error:
-                                    self.logger.debug(f'[{name}] Error parsing certificate: {str(parse_error)}')
-                            
-                            if successful_parses > 0:
-                                self.logger.info(f'[{name}] Successfully parsed {successful_parses}/{chunk_size} certificates in chunk')
-                            
-                        self.logger.info(f'[{name}] Added {cert_count} certificates to the stream')
-
-                    except aiohttp.ClientError as e:
-                        self.logger.error(f"[{name}] Network error while getting new results: {str(e)}")
-                        await asyncio.sleep(60)
-                        continue
-                    except Exception as e:
-                        self.logger.error(f"[{name}] Unexpected error while processing certificates: {str(e)}")
-                        await asyncio.sleep(60)
-                        continue
-
-                    self.logger.info(f'[{name}] Update complete, new tree size: {tree_size}')
-                    latest_size = tree_size
-                else:
-                    self.logger.info(f'[{name}] [{latest_size}|{tree_size}] No new certificates')
-
-                self.logger.debug(f'[{name}] Sleeping for 30 seconds before next check')
-                await asyncio.sleep(30)
+            session = await self.create_session()
+            url = f"{log_url.rstrip('/')}/ct/v1/get-sth"
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {"tree_size": data.get("tree_size", 0), "url": log_url}
         except Exception as e:
-            print("Encountered an exception while getting new results! -> {}".format(e))
-            return
-
-    async def get_new_results(self, operator_information, latest_size, tree_size):
-        total_size = tree_size - latest_size
-        start = latest_size
-
-        end = start + self.MAX_BLOCK_SIZE
-
-        chunks = math.ceil(total_size / self.MAX_BLOCK_SIZE)
-
-        self.logger.info("Retrieving {} certificates ({} -> {}) for {}".format(tree_size-latest_size, latest_size, tree_size, operator_information['description']))
-        async with aiohttp.ClientSession(loop=self.loop) as session:
-            for _ in range(chunks):
-                if end >= tree_size:
-                    end = tree_size - 1
-
-                assert end >= start, "End {} is less than start {}!".format(end, start)
-                assert end < tree_size, "End {} is less than tree_size {}".format(end, tree_size)
-
-                url = "https://{}/ct/v1/get-entries?start={}&end={}".format(operator_information['url'], start, end)
-
-                async with session.get(url) as response:
-                    certificates = await response.json()
-                    if 'error_message' in certificates:
-                        print("error!")
-
-                    for index, cert in zip(range(start, end+1), certificates['entries']):
-                        cert['index'] = index
-
-                    yield certificates['entries']
-
-                start += self.MAX_BLOCK_SIZE
-                end = start + self.MAX_BLOCK_SIZE + 1
-
-class DummyTransparencyWatcher(object):
-    stream = asyncio.Queue()
-    def get_tasks(self):
+            logger.debug(f"Failed to get STH from {log_url}: {e}")
+        return {"tree_size": 0, "url": log_url}
+    
+    async def get_entries(self, log_url: str, start: int, end: int) -> list:
+        try:
+            session = await self.create_session()
+            url = f"{log_url.rstrip('/')}/ct/v1/get-entries"
+            params = {"start": start, "end": min(end, start + MAX_BLOCK_SIZE - 1)}
+            
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    entries = data.get("entries", [])
+                    for i, entry in enumerate(entries):
+                        entry["log_url"] = log_url
+                        entry["index"] = start + i
+                    return entries
+        except Exception as e:
+            logger.debug(f"Failed to get entries from {log_url}: {e}")
         return []
-
-if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    watcher = TransparencyWatcher(loop)
-    loop.run_until_complete(asyncio.gather(*watcher.get_tasks()))
+    
+    async def process_log(self, log_url: str):
+        try:
+            # Get current tree size
+            sth = await self.get_sth(log_url)
+            tree_size = sth.get("tree_size", 0)
+            
+            if tree_size == 0:
+                return
+            # Get last known position
+            last_pos = self.log_positions.get(log_url, max(0, tree_size - 10000))
+            
+            # Fetch new entries
+            while last_pos < tree_size and self.running:
+                end = min(last_pos + MAX_BLOCK_SIZE, tree_size)
+                entries = await self.get_entries(log_url, last_pos, end)
+                
+                if not entries:
+                    break
+                
+                for entry in entries:
+                    if not self.queue.full():
+                        await self.queue.put(entry)
+                    else:
+                        # Queue full, wait a bit
+                        await asyncio.sleep(0.1)
+                        try:
+                            await asyncio.wait_for(
+                                self.queue.put(entry),
+                                timeout=1.0
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                
+                last_pos = end
+                self.log_positions[log_url] = last_pos
+                
+                # Small delay between batches
+                await asyncio.sleep(0.05)
+                
+        except Exception as e:
+            logger.error(f"Error processing log {log_url}: {e}")
+    
+    async def watch_logs(self, poll_interval: int = 5):
+        self.running = True
+        await self.create_session()
+        logger.info(f"Starting CT log watcher with {len(CT_LOG_SOURCES)} log sources")
+        
+        while self.running:
+            try:
+                # Process all logs concurrently in batches
+                batch_size = 20
+                for i in range(0, len(CT_LOG_SOURCES), batch_size):
+                    batch = CT_LOG_SOURCES[i:i + batch_size]
+                    tasks = [self.process_log(log_url) for log_url in batch]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    await asyncio.sleep(0.5)  # Small delay between batches
+                
+                # Wait before next poll cycle
+                await asyncio.sleep(poll_interval)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in watch loop: {e}")
+                await asyncio.sleep(poll_interval)
+        
+        await self.close()
+    
+    def get_tasks(self):
+        """Get list of monitoring tasks (compatible interface)"""
+        return [{"url": log_url, "name": log_url.split("/")[-1]} for log_url in CT_LOG_SOURCES]
+    
+    async def get_queue_item(self, timeout: float = 1.0):
+        """Get item from queue with timeout"""
+        try:
+            return await asyncio.wait_for(self.queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+    
+    @property
+    def queue_size(self):
+        return self.queue.qsize()

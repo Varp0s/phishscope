@@ -1,7 +1,6 @@
 import base64
 import datetime
 import logging
-import time
 
 from collections import OrderedDict
 
@@ -57,7 +56,6 @@ def serialize_certificate(certificate):
     not_after_datetime = datetime.datetime.strptime(certificate.get_notAfter().decode('ascii'), "%Y%m%d%H%M%SZ")
     return {
         "subject": {
-            "aggregated": repr(certificate.get_subject())[18:-2],
             "C": subject.C,
             "ST": subject.ST,
             "L": subject.L,
@@ -69,12 +67,7 @@ def serialize_certificate(certificate):
         "not_before": not_before_datetime.timestamp(),
         "not_after": not_after_datetime.timestamp(),
         "serial_number": '{0:x}'.format(int(certificate.get_serial_number())),
-        "fingerprint": str(certificate.digest("sha1"),'utf-8'),
-        "as_der": base64.b64encode(
-            crypto.dump_certificate(
-                crypto.FILETYPE_ASN1, certificate
-            )
-        ).decode('utf-8')
+        "fingerprint": str(certificate.digest("sha1"),'utf-8')
     }
 
 def add_all_domains(cert_data):
@@ -91,17 +84,26 @@ def add_all_domains(cert_data):
     cert_data['leaf_cert']['all_domains'] = list(OrderedDict.fromkeys(all_domains))
     return cert_data
 
-def parse_ctl_entry(entry, operator_information):
+def parse_ctl_entry(entry, operator_information=None):
+    """
+    Parse a Certificate Transparency log entry
+    
+    Args:
+        entry: CT log entry with 'leaf_input' and optionally 'extra_data', 'log_url', 'index'
+        operator_information: Optional dict with 'url' and 'description' keys
+    
+    Returns:
+        Parsed certificate data dict or None on error
+    """
     try:
         mtl = MerkleTreeHeader.parse(base64.b64decode(entry['leaf_input']))
     except Exception as e:
-        logging.error(f"Error parsing MerkleTreeHeader: {e}")
+        logging.debug(f"Error parsing MerkleTreeHeader: {e}")
         return None
 
     cert_data = {}
     try:
         if mtl.LogEntryType == "X509LogEntryType":
-            cert_data['update_type'] = "X509LogEntry"
             try:
                 if isinstance(mtl.Entry, bytes):
                     parsed_cert = Certificate.parse(mtl.Entry)
@@ -121,15 +123,13 @@ def parse_ctl_entry(entry, operator_information):
                             chain.append(crypto.load_certificate(crypto.FILETYPE_ASN1, cert.CertData))
                         
             except Exception as cert_parse_error:
-                logging.error(f"Error parsing X509 certificate: {cert_parse_error}")
+                logging.debug(f"Error parsing X509 certificate: {cert_parse_error}")
                 try:
                     chain = [crypto.load_certificate(crypto.FILETYPE_ASN1, mtl.Entry)]
-                except Exception as fallback_error:
-                    logging.error(f"Fallback parsing also failed: {fallback_error}")
+                except Exception:
                     return None
                     
         else:
-            cert_data['update_type'] = "PreCertEntry"
             try:
                 if 'extra_data' in entry and entry['extra_data']:
                     extra_data = PreCertEntry.parse(base64.b64decode(entry['extra_data']))
@@ -145,27 +145,32 @@ def parse_ctl_entry(entry, operator_information):
                     chain = [crypto.load_certificate(crypto.FILETYPE_ASN1, mtl.Entry)]
                     
             except Exception as precert_parse_error:
-                logging.error(f"Error parsing PreCert entry: {precert_parse_error}")
+                logging.debug(f"Error parsing PreCert entry: {precert_parse_error}")
                 try:
                     chain = [crypto.load_certificate(crypto.FILETYPE_ASN1, mtl.Entry)]
-                except Exception as fallback_error:
-                    logging.error(f"PreCert fallback parsing also failed: {fallback_error}")
+                except Exception:
                     return None
 
-        cert_data.update({
-            "leaf_cert": serialize_certificate(chain[0]),
-            "chain": [serialize_certificate(x) for x in chain[1:]] if len(chain) > 1 else [],
-            "cert_index": entry.get('index', 0),
-            "seen": time.time()
-        })
-
+        cert_data['leaf_cert'] = serialize_certificate(chain[0])
         add_all_domains(cert_data)
-        cert_data['source'] = {
-            "url": operator_information['url'],
-            "name": operator_information['description']
-        }
+        
+        # Source information - from entry or operator_information
+        if operator_information:
+            cert_data['source'] = {
+                "url": operator_information.get('url', ''),
+                "name": operator_information.get('description', '')
+            }
+        elif 'log_url' in entry:
+            cert_data['source'] = {
+                "url": entry.get('log_url', ''),
+                "name": entry.get('log_url', '').split('/')[-1],
+                "index": entry.get('index', 0)
+            }
+        else:
+            cert_data['source'] = {"url": "", "name": "unknown"}
+            
         return cert_data
         
     except Exception as e:
-        logging.error(f"General error parsing CT entry: {e}")
+        logging.debug(f"General error parsing CT entry: {e}")
         return None

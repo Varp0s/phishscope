@@ -1,11 +1,12 @@
 import asyncio
-import asyncpg
 import logging
 import os
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import json
 from dotenv import load_dotenv
+import psycopg
+from psycopg_pool import AsyncConnectionPool
 
 load_dotenv()
 
@@ -27,15 +28,15 @@ class PostgreSQLHelper:
         
     async def connect(self):
         try:
-            self.pool = await asyncpg.create_pool(
-                host=self.host,
-                port=self.port,
-                database=self.database,
-                user=self.user,
-                password=self.password,
-                min_size=1,
-                max_size=10
+            conninfo = f"host={self.host} port={self.port} dbname={self.database} user={self.user} password={self.password}"
+            self.pool = AsyncConnectionPool(
+                conninfo=conninfo,
+                min_size=10,
+                max_size=50,
+                timeout=60,
+                open=True
             )
+            await self.pool.wait()
             self.logger.info(f"Connected to PostgreSQL database: {self.database}")
             return True
         except Exception as e:
@@ -72,17 +73,67 @@ class PostgreSQLHelper:
         ]
         
         try:
-            async with self.pool.acquire() as conn:
-                await conn.execute(create_certificates_table)
-                
-                for index_sql in create_indexes:
-                    await conn.execute(index_sql)
-                
-                self.logger.info("Database tables initialized successfully with subject_cn as unique")
-                return True
+            async with self.pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(create_certificates_table)
+                    
+                    for index_sql in create_indexes:
+                        await cur.execute(index_sql)
+                    
+                    await conn.commit()
+                    self.logger.info("Database tables initialized successfully with subject_cn as unique")
+                    return True
         except Exception as e:
             self.logger.error(f"Failed to initialize tables: {e}")
             return False
+    
+    async def bulk_insert_certificates(self, cert_data_list: List[Dict[str, Any]]) -> int:
+        if not cert_data_list:
+            return 0
+            
+        insert_query = """
+        INSERT INTO certificates (
+            subject_cn, issuer_cn, serial_number, fingerprint, 
+            not_before, not_after, domains, raw_data
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (subject_cn) DO UPDATE SET
+            serial_number = EXCLUDED.serial_number,
+            fingerprint = EXCLUDED.fingerprint,
+            not_before = EXCLUDED.not_before,
+            not_after = EXCLUDED.not_after,
+            domains = EXCLUDED.domains,
+            raw_data = EXCLUDED.raw_data,
+            updated_at = CURRENT_TIMESTAMP;
+        """
+        
+        try:
+            async with self.pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        inserted = 0
+                        for cert_data in cert_data_list:
+                            subject_cn = cert_data.get('subject_cn')
+                            if not subject_cn:
+                                continue
+                                
+                            await cur.execute(
+                                insert_query,
+                                (
+                                    subject_cn,
+                                    cert_data.get('issuer_cn'),
+                                    cert_data.get('serial_number'),
+                                    cert_data.get('fingerprint'),
+                                    cert_data.get('not_before'),
+                                    cert_data.get('not_after'),
+                                    cert_data.get('domains'), 
+                                    json.dumps(cert_data.get('raw_data', {}))
+                                )
+                            )
+                            inserted += 1
+                        return inserted
+        except Exception as e:
+            self.logger.error(f"Failed to bulk insert certificates: {e}")
+            return 0
     
     async def insert_certificate(self, cert_data: Dict[str, Any]) -> Optional[int]:
         subject_cn = cert_data.get('subject_cn')
@@ -94,9 +145,8 @@ class PostgreSQLHelper:
         INSERT INTO certificates (
             subject_cn, issuer_cn, serial_number, fingerprint, 
             not_before, not_after, domains, raw_data
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (subject_cn) DO UPDATE SET
-            issuer_cn = EXCLUDED.issuer_cn,
             serial_number = EXCLUDED.serial_number,
             fingerprint = EXCLUDED.fingerprint,
             not_before = EXCLUDED.not_before,
@@ -108,19 +158,23 @@ class PostgreSQLHelper:
         """
         
         try:
-            async with self.pool.acquire() as conn:
-                result = await conn.fetchrow(
-                    insert_query,
-                    subject_cn,
-                    cert_data.get('issuer_cn'),
-                    cert_data.get('serial_number'),
-                    cert_data.get('fingerprint'),
-                    cert_data.get('not_before'),
-                    cert_data.get('not_after'),
-                    cert_data.get('domains'), 
-                    json.dumps(cert_data.get('raw_data', {}))
-                )
-                return result['id'] if result else None
+            async with self.pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        insert_query,
+                        (
+                            subject_cn,
+                            cert_data.get('issuer_cn'),
+                            cert_data.get('serial_number'),
+                            cert_data.get('fingerprint'),
+                            cert_data.get('not_before'),
+                            cert_data.get('not_after'),
+                            cert_data.get('domains'), 
+                            json.dumps(cert_data.get('raw_data', {}))
+                        )
+                    )
+                    result = await cur.fetchone()
+                    return result[0] if result else None
         except Exception as e:
             self.logger.error(f"Failed to insert certificate: {e}")
             return None
@@ -129,15 +183,20 @@ class PostgreSQLHelper:
         query = """
         SELECT id, subject_cn, domains, created_at, fingerprint, updated_at
         FROM certificates
-        WHERE domains ILIKE $1
+        WHERE domains ILIKE %s
         ORDER BY updated_at DESC, created_at DESC
-        LIMIT $2;
+        LIMIT %s;
         """
         
         try:
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, f"%{search_term}%", limit)
-                return [dict(row) for row in rows]
+            async with self.pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(query, (f"%{search_term}%", limit))
+                    rows = await cur.fetchall()
+                    if not rows:
+                        return []
+                    columns = [desc[0] for desc in cur.description]
+                    return [dict(zip(columns, row)) for row in rows]
         except Exception as e:
             self.logger.error(f"Failed to search domains: {e}")
             return []
@@ -145,17 +204,22 @@ class PostgreSQLHelper:
     async def search_domains_fulltext(self, search_term: str, limit: int = 100) -> List[Dict[str, Any]]:
         query = """
         SELECT id, subject_cn, domains, created_at, fingerprint, updated_at,
-               ts_rank(to_tsvector('english', domains), plainto_tsquery('english', $1)) as rank
+               ts_rank(to_tsvector('english', domains), plainto_tsquery('english', %s)) as rank
         FROM certificates
-        WHERE to_tsvector('english', domains) @@ plainto_tsquery('english', $1)
+        WHERE to_tsvector('english', domains) @@ plainto_tsquery('english', %s)
         ORDER BY rank DESC, updated_at DESC, created_at DESC
-        LIMIT $2;
+        LIMIT %s;
         """
         
         try:
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, search_term, limit)
-                return [dict(row) for row in rows]
+            async with self.pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(query, (search_term, search_term, limit))
+                    rows = await cur.fetchall()
+                    if not rows:
+                        return []
+                    columns = [desc[0] for desc in cur.description]
+                    return [dict(zip(columns, row)) for row in rows]
         except Exception as e:
             self.logger.error(f"Failed to full-text search domains: {e}")
             return []
@@ -164,15 +228,20 @@ class PostgreSQLHelper:
         query = """
         SELECT id, subject_cn, domains, created_at, fingerprint, updated_at
         FROM certificates
-        WHERE subject_cn ILIKE $1
+        WHERE subject_cn ILIKE %s
         ORDER BY updated_at DESC, created_at DESC
-        LIMIT $2;
+        LIMIT %s;
         """
         
         try:
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, f"%{search_term}%", limit)
-                return [dict(row) for row in rows]
+            async with self.pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(query, (f"%{search_term}%", limit))
+                    rows = await cur.fetchall()
+                    if not rows:
+                        return []
+                    columns = [desc[0] for desc in cur.description]
+                    return [dict(zip(columns, row)) for row in rows]
         except Exception as e:
             self.logger.error(f"Failed to search by subject_cn: {e}")
             return []
@@ -180,13 +249,18 @@ class PostgreSQLHelper:
     async def get_certificate_by_subject_cn(self, subject_cn: str) -> Optional[Dict[str, Any]]:
         query = """
         SELECT * FROM certificates
-        WHERE subject_cn = $1;
+        WHERE subject_cn = %s;
         """
         
         try:
-            async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(query, subject_cn)
-                return dict(row) if row else None
+            async with self.pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(query, (subject_cn,))
+                    row = await cur.fetchone()
+                    if not row:
+                        return None
+                    columns = [desc[0] for desc in cur.description]
+                    return dict(zip(columns, row))
         except Exception as e:
             self.logger.error(f"Failed to get certificate by subject_cn: {e}")
             return None
@@ -196,52 +270,62 @@ class PostgreSQLHelper:
             query = """
             SELECT * FROM certificates
             ORDER BY updated_at DESC, created_at DESC
-            LIMIT $1;
+            LIMIT %s;
             """
-            params = [limit]
+            params = (limit,)
         else:
             query = """
             SELECT * FROM certificates
             ORDER BY updated_at DESC, created_at DESC;
             """
-            params = []
+            params = ()
         
         try:
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, *params)
-                return [dict(row) for row in rows]
+            async with self.pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(query, params)
+                    rows = await cur.fetchall()
+                    if not rows:
+                        return []
+                    columns = [desc[0] for desc in cur.description]
+                    return [dict(zip(columns, row)) for row in rows]
         except Exception as e:
             self.logger.error(f"Failed to export certificates: {e}")
             return []
     
     async def get_stats(self) -> Dict[str, Any]:
         try:
-            async with self.pool.acquire() as conn:
-                total_certs = await conn.fetchval("SELECT COUNT(*) FROM certificates")
-                recent_certs = await conn.fetchval(
-                    "SELECT COUNT(*) FROM certificates WHERE created_at >= NOW() - INTERVAL '24 hours'"
-                )
-                updated_certs = await conn.fetchval(
-                    "SELECT COUNT(*) FROM certificates WHERE updated_at > created_at"
-                )
-                unique_subjects = await conn.fetchval("SELECT COUNT(DISTINCT subject_cn) FROM certificates")
-                
-                return {
-                    'total_certificates': total_certs,
-                    'recent_certificates_24h': recent_certs,
-                    'updated_certificates': updated_certs,
-                    'unique_subject_cns': unique_subjects
-                }
+            async with self.pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT COUNT(*) FROM certificates")
+                    total_certs = (await cur.fetchone())[0]
+                    
+                    await cur.execute("SELECT COUNT(*) FROM certificates WHERE created_at >= NOW() - INTERVAL '24 hours'")
+                    recent_certs = (await cur.fetchone())[0]
+                    
+                    await cur.execute("SELECT COUNT(*) FROM certificates WHERE updated_at > created_at")
+                    updated_certs = (await cur.fetchone())[0]
+                    
+                    await cur.execute("SELECT COUNT(DISTINCT subject_cn) FROM certificates")
+                    unique_subjects = (await cur.fetchone())[0]
+                    
+                    return {
+                        'total_certificates': total_certs,
+                        'recent_certificates_24h': recent_certs,
+                        'updated_certificates': updated_certs,
+                        'unique_subject_cns': unique_subjects
+                    }
         except Exception as e:
             self.logger.error(f"Failed to get stats: {e}")
             return {}
     
     async def reset_database(self) -> bool:
         try:
-            async with self.pool.acquire() as conn:
-                await conn.execute("DROP TABLE IF EXISTS certificates CASCADE")
-                self.logger.info("Dropped certificates table")
-                return await self.init_tables()
+            async with self.pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("DROP TABLE IF EXISTS certificates CASCADE")
+                    self.logger.info("Dropped certificates table")
+                    return await self.init_tables()
         except Exception as e:
             self.logger.error(f"Failed to reset database: {e}")
             return False
